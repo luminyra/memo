@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"iter"
 	"math/rand/v2"
 	"slices"
@@ -44,6 +45,15 @@ type Config[K comparable, V any] struct {
 	// long after its TTL while it is reloaded in the background. It requires
 	// a Loader and a TTL.
 	StaleWhileRevalidate time.Duration
+
+	// Shards splits the cache into this many independently locked parts,
+	// chosen by a hash of the key, so that concurrent callers working on
+	// different keys rarely wait for each other. Each shard holds
+	// Capacity/Shards entries (rounded up) and applies Policy on its own, so
+	// eviction order is exact within a shard only. Zero or one means a single
+	// shard. Use about as many shards as busy goroutines, such as
+	// runtime.GOMAXPROCS(0), when profiling shows contention.
+	Shards int
 }
 
 func (cfg Config[K, V]) validate() error {
@@ -66,6 +76,9 @@ func (cfg Config[K, V]) validate() error {
 	if cfg.StaleWhileRevalidate < 0 {
 		errs = append(errs, fmt.Errorf("stale-while-revalidate must not be negative, got %s", cfg.StaleWhileRevalidate))
 	}
+	if cfg.Shards < 0 {
+		errs = append(errs, fmt.Errorf("shards must not be negative, got %d", cfg.Shards))
+	}
 	if cfg.StaleWhileRevalidate > 0 && (cfg.Loader == nil || cfg.TTL == 0) {
 		errs = append(errs, errors.New("stale-while-revalidate requires a loader and a ttl"))
 	}
@@ -73,12 +86,6 @@ func (cfg Config[K, V]) validate() error {
 		return fmt.Errorf("memo: invalid config: %w", err)
 	}
 	return nil
-}
-
-type entry[V any] struct {
-	value     V
-	isMissing bool
-	expires   time.Time // zero means never
 }
 
 type call[V any] struct {
@@ -92,12 +99,17 @@ type call[V any] struct {
 // concurrent use, and concurrent loads of the same key are coalesced into one
 // Loader call.
 type Cache[K comparable, V any] struct {
-	cfg Config[K, V]
+	cfg    Config[K, V]
+	epoch  time.Time // expiration times are monotonic offsets from epoch
+	seed   maphash.Seed
+	shards []shard[K, V]
+}
 
+type shard[K comparable, V any] struct {
 	mu       sync.Mutex
-	entries  map[K]*entry[V]
-	evictor  evictor[K]
+	store    store[K, V]
 	inflight map[K]*call[V]
+	_        [64]byte // keep the locks of neighboring shards on separate cache lines
 }
 
 // New validates cfg and returns an empty cache.
@@ -105,12 +117,27 @@ func New[K comparable, V any](cfg Config[K, V]) (*Cache[K, V], error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	return &Cache[K, V]{
-		cfg:      cfg,
-		entries:  make(map[K]*entry[V], cfg.Capacity),
-		evictor:  newEvictor[K](cfg.Policy),
-		inflight: make(map[K]*call[V]),
-	}, nil
+	n := max(cfg.Shards, 1)
+	perShard := (cfg.Capacity + n - 1) / n
+	c := &Cache[K, V]{cfg: cfg, epoch: time.Now(), seed: maphash.MakeSeed(), shards: make([]shard[K, V], n)}
+	for i := range c.shards {
+		c.shards[i].store = newStore[K, V](cfg.Policy, perShard)
+		c.shards[i].inflight = make(map[K]*call[V])
+	}
+	return c, nil
+}
+
+func (c *Cache[K, V]) shardFor(key K) *shard[K, V] {
+	if len(c.shards) == 1 {
+		return &c.shards[0]
+	}
+	return &c.shards[maphash.Comparable(c.seed, key)%uint64(len(c.shards))]
+}
+
+// now returns the monotonic time since the cache was created. Unlike wall
+// clock times, it is unaffected by clock adjustments and fits in 8 bytes.
+func (c *Cache[K, V]) now() int64 {
+	return int64(time.Since(c.epoch))
 }
 
 // Set stores value under key with the configured TTL.
@@ -121,9 +148,11 @@ func (c *Cache[K, V]) Set(key K, value V) {
 // SetWithTTL stores value under key with ttl. Zero means the entry never
 // expires; jitter still applies to a positive ttl.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.store(key, &entry[V]{value: value, expires: c.expiry(ttl)})
+	expires := c.expiry(ttl)
+	sh := c.shardFor(key)
+	sh.mu.Lock()
+	sh.store.put(key, value, expires, false)
+	sh.mu.Unlock()
 }
 
 // Get returns the value for key. On a miss it calls the Loader, if any, and
@@ -131,18 +160,22 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) {
 // missing. err is the Loader's error, or ctx.Err() when ctx ends before the
 // load finishes; the load itself keeps running for other callers.
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, found bool, err error) {
-	c.mu.Lock()
-	if e, ok := c.lookup(key); ok {
-		c.mu.Unlock()
-		return e.value, !e.isMissing, nil
+	sh := c.shardFor(key)
+	sh.mu.Lock()
+	if v, isMissing, ok := c.lookup(sh, key); ok {
+		sh.mu.Unlock()
+		return v, !isMissing, nil
 	}
 	if c.cfg.Loader == nil {
-		c.mu.Unlock()
+		sh.mu.Unlock()
 		var zero V
 		return zero, false, nil
 	}
-	cl := c.startLoads([]K{key})[0]
-	c.mu.Unlock()
+	cl, isNew := startLoad(sh, key)
+	sh.mu.Unlock()
+	if isNew {
+		go c.load([]K{key}, []*call[V]{cl})
+	}
 
 	select {
 	case <-cl.done:
@@ -159,27 +192,39 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, found bool, err 
 // far together with the error.
 func (c *Cache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) {
 	result := make(map[K]V, len(keys))
-	var misses []K
-
-	c.mu.Lock()
+	var (
+		misses   []K // keys whose load this call waits for
+		calls    []*call[V]
+		newKeys  []K // keys whose load this call starts
+		newCalls []*call[V]
+	)
 	for _, key := range keys {
 		if _, ok := result[key]; ok || slices.Contains(misses, key) {
 			continue
 		}
-		if e, ok := c.lookup(key); ok {
-			if !e.isMissing {
-				result[key] = e.value
+		sh := c.shardFor(key)
+		sh.mu.Lock()
+		if v, isMissing, ok := c.lookup(sh, key); ok {
+			sh.mu.Unlock()
+			if !isMissing {
+				result[key] = v
 			}
 			continue
 		}
-		misses = append(misses, key)
+		if c.cfg.Loader == nil {
+			sh.mu.Unlock()
+			continue
+		}
+		cl, isNew := startLoad(sh, key)
+		sh.mu.Unlock()
+		misses, calls = append(misses, key), append(calls, cl)
+		if isNew {
+			newKeys, newCalls = append(newKeys, key), append(newCalls, cl)
+		}
 	}
-	if len(misses) == 0 || c.cfg.Loader == nil {
-		c.mu.Unlock()
-		return result, nil
+	if len(newKeys) > 0 {
+		go c.load(newKeys, newCalls)
 	}
-	calls := c.startLoads(misses)
-	c.mu.Unlock()
 
 	var errs []error
 	for i, cl := range calls {
@@ -200,50 +245,47 @@ func (c *Cache[K, V]) GetMany(ctx context.Context, keys []K) (map[K]V, error) {
 	return result, errors.Join(errs...)
 }
 
-// lookup returns the usable entry for key and updates its eviction order. An
-// expired entry is still usable inside the stale-while-revalidate window,
-// and a reload is started for it. lookup must be called with c.mu held.
-func (c *Cache[K, V]) lookup(key K) (*entry[V], bool) {
-	e, ok := c.entries[key]
+// lookup returns the usable value for key and records the use. An expired
+// entry is still usable inside the stale-while-revalidate window, and a
+// reload is started for it. lookup must be called with sh.mu held.
+func (c *Cache[K, V]) lookup(sh *shard[K, V], key K) (value V, isMissing, ok bool) {
+	i, ok := sh.store.lookup(key)
 	if !ok {
-		return nil, false
+		return value, false, false
 	}
-	now := time.Now()
+	n := &sh.store.nodes[i]
+	value, isMissing = n.value, n.isMissing
+	if n.expires == 0 { // no TTL: skip reading the clock
+		sh.store.touch(i)
+		return value, isMissing, true
+	}
+	now := c.now()
 	switch {
-	case e.expires.IsZero() || now.Before(e.expires):
-		c.evictor.touch(key)
-		return e, true
-	case c.cfg.StaleWhileRevalidate > 0 && now.Before(e.expires.Add(c.cfg.StaleWhileRevalidate)):
-		c.evictor.touch(key)
-		c.startLoads([]K{key})
-		return e, true
+	case now < n.expires:
+		sh.store.touch(i)
+		return value, isMissing, true
+	case c.cfg.StaleWhileRevalidate > 0 && now < n.expires+int64(c.cfg.StaleWhileRevalidate):
+		sh.store.touch(i)
+		if cl, isNew := startLoad(sh, key); isNew {
+			go c.load([]K{key}, []*call[V]{cl})
+		}
+		return value, isMissing, true
 	default:
-		c.delete(key)
-		return nil, false
+		sh.store.removeAt(i)
+		var zero V
+		return zero, false, false
 	}
 }
 
-// startLoads returns the in-flight load of each key, starting one Loader
-// call for the keys that have none. It must be called with c.mu held.
-func (c *Cache[K, V]) startLoads(keys []K) []*call[V] {
-	calls := make([]*call[V], len(keys))
-	var newKeys []K
-	var newCalls []*call[V]
-	for i, key := range keys {
-		if cl, ok := c.inflight[key]; ok {
-			calls[i] = cl
-			continue
-		}
-		cl := &call[V]{done: make(chan struct{})}
-		c.inflight[key] = cl
-		calls[i] = cl
-		newKeys = append(newKeys, key)
-		newCalls = append(newCalls, cl)
+// startLoad returns the in-flight load of key and reports whether the caller
+// must start it. It must be called with sh.mu held.
+func startLoad[K comparable, V any](sh *shard[K, V], key K) (*call[V], bool) {
+	if cl, ok := sh.inflight[key]; ok {
+		return cl, false
 	}
-	if len(newKeys) > 0 {
-		go c.load(newKeys, newCalls)
-	}
-	return calls
+	cl := &call[V]{done: make(chan struct{})}
+	sh.inflight[key] = cl
+	return cl, true
 }
 
 // load runs detached from any caller's context, so that a canceled Get does
@@ -253,13 +295,13 @@ func (c *Cache[K, V]) load(keys []K, calls []*call[V]) {
 	if err != nil {
 		err = fmt.Errorf("memo: load: %w", err)
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	for i, key := range keys {
 		cl := calls[i]
-		delete(c.inflight, key)
+		sh := c.shardFor(key)
+		sh.mu.Lock()
+		delete(sh.inflight, key)
 		if err != nil {
+			sh.mu.Unlock()
 			cl.err = err
 			close(cl.done)
 			continue
@@ -267,12 +309,14 @@ func (c *Cache[K, V]) load(keys []K, calls []*call[V]) {
 		v, ok := values[key]
 		switch {
 		case ok:
-			c.store(key, &entry[V]{value: v, expires: c.expiry(c.cfg.TTL)})
+			sh.store.put(key, v, c.expiry(c.cfg.TTL), false)
 		case c.cfg.CacheMissing:
-			c.store(key, &entry[V]{isMissing: true, expires: c.expiry(c.cfg.TTL)})
+			var zero V
+			sh.store.put(key, zero, c.expiry(c.cfg.TTL), true)
 		default:
-			c.delete(key)
+			sh.store.remove(key)
 		}
+		sh.mu.Unlock()
 		cl.value, cl.isFound = v, ok
 		close(cl.done)
 	}
@@ -281,14 +325,16 @@ func (c *Cache[K, V]) load(keys []K, calls []*call[V]) {
 // Peek returns the value for key without calling the Loader or updating the
 // eviction order. Expired values are not returned.
 func (c *Cache[K, V]) Peek(key K) (V, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.entries[key]
-	if !ok || e.isMissing || c.isExpired(e, time.Now()) {
-		var zero V
-		return zero, false
+	sh := c.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if i, ok := sh.store.lookup(key); ok {
+		if n := &sh.store.nodes[i]; !n.isMissing && !c.isExpired(n) {
+			return n.value, true
+		}
 	}
-	return e.value, true
+	var zero V
+	return zero, false
 }
 
 // Has reports whether key holds a fresh value that is not cached as missing.
@@ -300,15 +346,17 @@ func (c *Cache[K, V]) Has(key K) bool {
 // All returns an iterator over a snapshot of the fresh entries, in
 // unspecified order. Like Peek, it does not update the eviction order.
 func (c *Cache[K, V]) All() iter.Seq2[K, V] {
-	c.mu.Lock()
-	now := time.Now()
-	snapshot := make(map[K]V, len(c.entries))
-	for k, e := range c.entries {
-		if !e.isMissing && !c.isExpired(e, now) {
-			snapshot[k] = e.value
+	snapshot := make(map[K]V)
+	for i := range c.shards {
+		sh := &c.shards[i]
+		sh.mu.Lock()
+		for _, j := range sh.store.index {
+			if n := &sh.store.nodes[j]; !n.isMissing && !c.isExpired(n) {
+				snapshot[n.key] = n.value
+			}
 		}
+		sh.mu.Unlock()
 	}
-	c.mu.Unlock()
 	return func(yield func(K, V) bool) {
 		for k, v := range snapshot {
 			if !yield(k, v) {
@@ -320,60 +368,47 @@ func (c *Cache[K, V]) All() iter.Seq2[K, V] {
 
 // Delete removes key and reports whether it was present.
 func (c *Cache[K, V]) Delete(key K) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, ok := c.entries[key]
-	c.delete(key)
-	return ok
+	sh := c.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.store.remove(key)
 }
 
 // Purge removes every entry.
 func (c *Cache[K, V]) Purge() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.entries = make(map[K]*entry[V], c.cfg.Capacity)
-	c.evictor = newEvictor[K](c.cfg.Policy)
+	for i := range c.shards {
+		sh := &c.shards[i]
+		sh.mu.Lock()
+		sh.store.reset()
+		sh.mu.Unlock()
+	}
 }
 
 // Len returns the number of stored entries, including expired entries not yet
 // removed and keys cached as missing.
 func (c *Cache[K, V]) Len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.entries)
-}
-
-// store must be called with c.mu held.
-func (c *Cache[K, V]) store(key K, e *entry[V]) {
-	if _, ok := c.entries[key]; !ok {
-		for len(c.entries) >= c.cfg.Capacity {
-			victim, ok := c.evictor.victim()
-			if !ok {
-				break
-			}
-			c.delete(victim)
-		}
+	n := 0
+	for i := range c.shards {
+		sh := &c.shards[i]
+		sh.mu.Lock()
+		n += sh.store.len()
+		sh.mu.Unlock()
 	}
-	c.entries[key] = e
-	c.evictor.add(key)
+	return n
 }
 
-// delete must be called with c.mu held.
-func (c *Cache[K, V]) delete(key K) {
-	delete(c.entries, key)
-	c.evictor.remove(key)
+func (c *Cache[K, V]) isExpired(n *node[K, V]) bool {
+	return n.expires != 0 && c.now() >= n.expires
 }
 
-func (c *Cache[K, V]) isExpired(e *entry[V], now time.Time) bool {
-	return !e.expires.IsZero() && !now.Before(e.expires)
-}
-
-func (c *Cache[K, V]) expiry(ttl time.Duration) time.Time {
+// expiry returns the expiration time for an entry written now with ttl, or 0
+// when it never expires.
+func (c *Cache[K, V]) expiry(ttl time.Duration) int64 {
 	if ttl <= 0 {
-		return time.Time{}
+		return 0
 	}
 	if c.cfg.Jitter > 0 {
 		ttl -= time.Duration(float64(ttl) * c.cfg.Jitter * rand.Float64())
 	}
-	return time.Now().Add(ttl)
+	return c.now() + int64(ttl)
 }

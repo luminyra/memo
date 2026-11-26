@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"sync"
@@ -71,8 +72,9 @@ func TestJitterShortensTTL(t *testing.T) {
 		for i := range 100 {
 			c.Set(i, i)
 		}
-		for _, e := range c.entries {
-			ttl := time.Until(e.expires)
+		sh := &c.shards[0]
+		for _, i := range sh.store.index {
+			ttl := time.Duration(sh.store.nodes[i].expires - c.now())
 			if ttl <= 30*time.Second || ttl > time.Minute {
 				t.Fatalf("ttl with jitter = %s", ttl)
 			}
@@ -296,4 +298,133 @@ func TestDeleteAndPurge(t *testing.T) {
 	if !c.Has(3) {
 		t.Fatal("Set after Purge failed")
 	}
+}
+
+func BenchmarkGetHit(b *testing.B) {
+	c, _ := New(Config[int, int]{Capacity: 1024})
+	for i := range 1024 {
+		c.Set(i, i)
+	}
+	ctx := b.Context()
+	i := 0
+	for b.Loop() {
+		c.Get(ctx, i&1023)
+		i++
+	}
+}
+
+func BenchmarkGetHitParallel(b *testing.B) {
+	c, _ := New(Config[int, int]{Capacity: 1024})
+	for i := range 1024 {
+		c.Set(i, i)
+	}
+	ctx := b.Context()
+	var seed atomic.Uint64
+	b.RunParallel(func(pb *testing.PB) {
+		// Each goroutine reads its own random sequence of keys, as
+		// independent requests would.
+		rng := rand.New(rand.NewPCG(seed.Add(1), 0))
+		for pb.Next() {
+			c.Get(ctx, rng.IntN(1024))
+		}
+	})
+}
+
+func BenchmarkSetWithEviction(b *testing.B) {
+	for _, policy := range []Policy{LRU, LFU, FIFO} {
+		b.Run(policy.String(), func(b *testing.B) {
+			c, _ := New(Config[int, int]{Capacity: 1024, Policy: policy})
+			i := 0
+			for b.Loop() {
+				c.Set(i, i) // every new key past 1024 evicts one entry
+				i++
+			}
+		})
+	}
+}
+
+func BenchmarkGetManyHit(b *testing.B) {
+	c, _ := New(Config[int, int]{Capacity: 1024, Loader: func(context.Context, []int) (map[int]int, error) { return nil, nil }})
+	keys := make([]int, 64)
+	for i := range keys {
+		keys[i] = i
+		c.Set(i, i)
+	}
+	ctx := b.Context()
+	for b.Loop() {
+		c.GetMany(ctx, keys)
+	}
+}
+
+func TestShards(t *testing.T) {
+	if _, err := New(Config[int, int]{Capacity: 1, Shards: -1}); err == nil {
+		t.Fatal("negative Shards accepted")
+	}
+
+	var batches [][]int
+	var mu sync.Mutex
+	loader := func(_ context.Context, ids []int) (map[int]int, error) {
+		mu.Lock()
+		batches = append(batches, slices.Clone(ids))
+		mu.Unlock()
+		values := make(map[int]int, len(ids))
+		for _, id := range ids {
+			values[id] = id * 10
+		}
+		return values, nil
+	}
+	c := mustNew(t, Config[int, int]{Capacity: 64, Shards: 4, Loader: loader})
+	for i := range 32 {
+		c.Set(i, i)
+	}
+	if c.Len() != 32 {
+		t.Fatalf("Len = %d", c.Len())
+	}
+	for i := range 32 {
+		if v, ok := c.Peek(i); !ok || v != i {
+			t.Fatalf("Peek(%d) = %d, %t", i, v, ok)
+		}
+	}
+	// Misses spread over every shard still load in one call.
+	got, err := c.GetMany(t.Context(), []int{100, 101, 102, 103, 104, 105, 106, 107})
+	if err != nil || len(got) != 8 || got[105] != 1050 || len(batches) != 1 {
+		t.Fatalf("GetMany = %v, %v after %d batches", got, err, len(batches))
+	}
+	if !c.Delete(3) || c.Has(3) {
+		t.Fatal("Delete across shards failed")
+	}
+	if n := len(maps.Collect(c.All())); n != 39 {
+		t.Fatalf("All has %d entries, want 39", n)
+	}
+	c.Purge()
+	if c.Len() != 0 {
+		t.Fatalf("Len after Purge = %d", c.Len())
+	}
+}
+
+func TestShardCapacityIsBounded(t *testing.T) {
+	c := mustNew(t, Config[int, int]{Capacity: 10, Shards: 4}) // 3 entries per shard
+	for i := range 1000 {
+		c.Set(i, i)
+	}
+	if n := c.Len(); n > 12 {
+		t.Fatalf("Len = %d, want at most 4 shards × 3 entries", n)
+	}
+}
+
+func BenchmarkGetHitParallelSharded(b *testing.B) {
+	c, _ := New(Config[int, int]{Capacity: 1024, Shards: 16})
+	for i := range 1024 {
+		c.Set(i, i)
+	}
+	ctx := b.Context()
+	var seed atomic.Uint64
+	b.RunParallel(func(pb *testing.PB) {
+		// Each goroutine reads its own random sequence of keys, as
+		// independent requests would.
+		rng := rand.New(rand.NewPCG(seed.Add(1), 0))
+		for pb.Next() {
+			c.Get(ctx, rng.IntN(1024))
+		}
+	})
 }
