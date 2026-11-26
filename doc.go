@@ -25,7 +25,9 @@
 //
 // # Behavior
 //
-// A Cache is safe for concurrent use. [Cache.All] iterates over a snapshot of
+// A Cache is safe for concurrent use. Config.Shards splits it into
+// independently locked parts for heavily concurrent workloads, and writes
+// reuse memory instead of allocating. [Cache.All] iterates over a snapshot of
 // the fresh entries. Expired entries are removed lazily on access or when
 // evicted, so [Cache.Len] may count entries that have expired but have not
 // been removed yet. Time-dependent behavior uses the [time] package directly,
