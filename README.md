@@ -43,7 +43,7 @@ It is an **in-process** cache: each instance of your program has its own copy. I
 go get github.com/luminyra/memo
 ```
 
-memo requires Go 1.27 or later and has no dependencies.
+memo requires Go 1.27 or later. Its only dependency is [conc](https://github.com/luminyra/conc), another Luminyra library with no dependencies.
 
 ## Getting started
 
@@ -197,7 +197,9 @@ synctest.Test(t, func(t *testing.T) {
 ## How it works
 
 - A `Cache` is safe for concurrent use. Concurrent misses for the same key wait for **one** loader call, and a caller that gives up (its context ends) does not cancel the load for the others.
-- The loader runs with a background context, detached from any single request.
+- The loader runs with a background context, detached from any single request. A miss whose context has already ended returns `context.Cause(ctx)` without starting a load; cached values are still returned.
+- Every load finishes its waiters however the loader ends. A loader error is returned to each of them; a loader that calls `runtime.Goexit` fails the load with `conc.ErrGoexit`; a loader panic re-panics in the waiting callers as a `conc.Panic` with the original stack, or in the loading goroutine if nobody is waiting.
+- `MaxConcurrentLoads` caps the number of loader calls running at once. Loads beyond the cap queue in arrival order, and their callers can still give up through their contexts.
 - Expired entries are removed lazily, when they are read or evicted, so `Len` may briefly include them.
 - `Peek`, `Has` and `All` read the cache without loading and without changing the eviction order.
 - One mutex protects each shard, one shard by default. Under heavy concurrent use, set `Shards`; see [Performance](#performance).

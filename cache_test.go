@@ -5,6 +5,7 @@ import (
 	"errors"
 	"maps"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +13,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/luminyra/conc"
 )
 
 func mustNew[K comparable, V any](t *testing.T, cfg Config[K, V]) *Cache[K, V] {
@@ -35,6 +38,8 @@ func TestConfigValidation(t *testing.T) {
 		{name: "ttl", cfg: Config[int, int]{Capacity: 1, TTL: -1}},
 		{name: "missing without loader", cfg: Config[int, int]{Capacity: 1, CacheMissing: true}},
 		{name: "negative stale window", cfg: Config[int, int]{Capacity: 1, StaleWhileRevalidate: -1}},
+		{name: "negative max loads", cfg: Config[int, int]{Capacity: 1, Loader: loader, MaxConcurrentLoads: -1}},
+		{name: "max loads without loader", cfg: Config[int, int]{Capacity: 1, MaxConcurrentLoads: 1}},
 		{name: "stale without ttl", cfg: Config[int, int]{Capacity: 1, Loader: loader, StaleWhileRevalidate: time.Second}},
 	}
 	for _, tt := range tests {
@@ -425,6 +430,154 @@ func BenchmarkGetHitParallelSharded(b *testing.B) {
 		rng := rand.New(rand.NewPCG(seed.Add(1), 0))
 		for pb.Next() {
 			c.Get(ctx, rng.IntN(1024))
+		}
+	})
+}
+
+func TestLoaderAbnormalExit(t *testing.T) {
+	t.Run("goexit", func(t *testing.T) {
+		c := mustNew(t, Config[int, int]{Capacity: 10, Loader: func(context.Context, []int) (map[int]int, error) {
+			runtime.Goexit()
+			return nil, nil
+		}})
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		if _, _, err := c.Get(ctx, 1); !errors.Is(err, conc.ErrGoexit) {
+			t.Fatalf("Get error = %v, want ErrGoexit", err)
+		}
+		got, err := c.GetMany(ctx, []int{2, 3})
+		if !errors.Is(err, conc.ErrGoexit) || len(got) != 0 {
+			t.Fatalf("GetMany = %v, %v, want ErrGoexit", got, err)
+		}
+	})
+	t.Run("panic", func(t *testing.T) {
+		var calls atomic.Int32
+		c := mustNew(t, Config[int, int]{Capacity: 10, Loader: func(_ context.Context, keys []int) (map[int]int, error) {
+			if calls.Add(1) == 1 {
+				panic("loader bug")
+			}
+			return map[int]int{keys[0]: 10}, nil
+		}})
+		p, ok := catchPanic(func() { _, _, _ = c.Get(t.Context(), 1) }).(conc.Panic)
+		if !ok || p.Value != "loader bug" || !strings.Contains(p.Stack, "TestLoaderAbnormalExit") {
+			t.Fatalf("Get panic = %#v, want conc.Panic from the loader", p)
+		}
+		// The failed load left nothing behind, so the next Get loads again.
+		if v, found, err := c.Get(t.Context(), 1); v != 10 || !found || err != nil {
+			t.Fatalf("Get after panic = %d, %t, %v", v, found, err)
+		}
+	})
+	t.Run("panic in GetMany", func(t *testing.T) {
+		c := mustNew(t, Config[int, int]{Capacity: 10, Loader: func(context.Context, []int) (map[int]int, error) {
+			panic("batch bug")
+		}})
+		if p, ok := catchPanic(func() { _, _ = c.GetMany(t.Context(), []int{1, 2}) }).(conc.Panic); !ok || p.Value != "batch bug" {
+			t.Fatalf("GetMany panic = %#v", p)
+		}
+	})
+}
+
+func catchPanic(fn func()) (v any) {
+	defer func() { v = recover() }()
+	fn()
+	return nil
+}
+
+func TestEndedContextStartsNoLoad(t *testing.T) {
+	var calls atomic.Int32
+	c := mustNew(t, Config[int, int]{Capacity: 10, Loader: func(_ context.Context, keys []int) (map[int]int, error) {
+		calls.Add(1)
+		return nil, nil
+	}})
+	c.Set(1, 1)
+	cause := errors.New("request gone")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cancel(cause)
+
+	if v, found, err := c.Get(ctx, 1); v != 1 || !found || err != nil {
+		t.Fatalf("hit with ended ctx = %d, %t, %v", v, found, err)
+	}
+	if _, _, err := c.Get(ctx, 2); !errors.Is(err, cause) {
+		t.Fatalf("miss with ended ctx error = %v, want cause", err)
+	}
+	got, err := c.GetMany(ctx, []int{1, 2})
+	if !errors.Is(err, cause) || !maps.Equal(got, map[int]int{1: 1}) {
+		t.Fatalf("GetMany with ended ctx = %v, %v", got, err)
+	}
+	if got, err := c.GetMany(ctx, []int{1}); err != nil || got[1] != 1 {
+		t.Fatalf("GetMany hits with ended ctx = %v, %v", got, err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("loader calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestCanceledWaitersLeave(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		c := mustNew(t, Config[int, int]{Capacity: 10, Loader: func(_ context.Context, keys []int) (map[int]int, error) {
+			<-release
+			return nil, nil
+		}})
+		ctx, cancel := context.WithCancel(t.Context())
+		errs := make(chan error, 2)
+		go func() { _, _, err := c.Get(ctx, 1); errs <- err }()
+		go func() { _, err := c.GetMany(ctx, []int{2, 1, 3}); errs <- err }()
+		synctest.Wait()
+		cancel()
+		for range 2 {
+			if err := <-errs; !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled wait error = %v", err)
+			}
+		}
+		for _, key := range []int{1, 2, 3} {
+			sh := c.shardFor(key)
+			sh.mu.Lock()
+			if n := sh.inflight[key].waiters; n != 0 {
+				t.Errorf("key %d has %d waiters after cancellation", key, n)
+			}
+			sh.mu.Unlock()
+		}
+		close(release)
+		synctest.Wait()
+		if c.Len() != 0 {
+			t.Errorf("Len = %d after loads of missing keys", c.Len())
+		}
+	})
+}
+
+func TestMaxConcurrentLoads(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var running, peak atomic.Int32
+		release := make(chan struct{})
+		c := mustNew(t, Config[int, int]{Capacity: 100, MaxConcurrentLoads: 2, Loader: func(_ context.Context, keys []int) (map[int]int, error) {
+			n := running.Add(1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			<-release
+			running.Add(-1)
+			return map[int]int{keys[0]: keys[0]}, nil
+		}})
+		var wg sync.WaitGroup
+		for key := range 5 {
+			wg.Go(func() {
+				if v, found, err := c.Get(t.Context(), key); v != key || !found || err != nil {
+					t.Errorf("Get(%d) = %d, %t, %v", key, v, found, err)
+				}
+			})
+		}
+		synctest.Wait()
+		if n := running.Load(); n != 2 {
+			t.Fatalf("running loads = %d, want 2", n)
+		}
+		close(release)
+		wg.Wait()
+		if p := peak.Load(); p != 2 {
+			t.Fatalf("peak concurrent loads = %d, want 2", p)
 		}
 	})
 }

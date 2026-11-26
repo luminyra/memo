@@ -21,7 +21,9 @@
 // same key are coalesced into one call. With Config.CacheMissing, keys the
 // Loader does not return are remembered until their TTL expires; with
 // Config.StaleWhileRevalidate, an expired value is served while it is
-// reloaded in the background.
+// reloaded in the background. Config.MaxConcurrentLoads caps the number of
+// Loader calls running at once. Every load finishes its waiters however the
+// Loader ends: a panic reaches the waiting callers as a [conc.Panic].
 //
 // # Behavior
 //
